@@ -270,7 +270,7 @@
       <button class="btn btn-primary" id="saveSettingsBtn">Save settings</button>
     </div>
 
-    <div class="card">
+    <div class="card" id="livePriceCard">
       <div class="section-title">Live price setup (one-time, ~2 min)</div>
       <div class="section-sub" style="margin-bottom:10px;">Gives fast, accurate one-tap prices from Google Finance through your own free Google account. Nothing is shared with anyone else.</div>
       <ol style="margin:0 0 12px 18px;padding:0;font-size:13px;line-height:1.55;">
@@ -283,6 +283,23 @@
       <div class="form-field"><label for="setPriceProxy">Web app URL</label><input type="url" id="setPriceProxy" placeholder="https://script.google.com/macros/s/…/exec" autocapitalize="off" autocorrect="off" /></div>
       <button class="btn btn-primary" id="saveProxyBtn">Save &amp; test</button>
       <div class="section-sub" id="proxyTestResult" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="card" id="backupCard">
+      <div class="section-title">Backup &amp; restore</div>
+      <div class="section-sub" style="margin-bottom:10px;">Saves everything: funds, reserves, contributions, transactions, Nifty log and settings. Restore it here, or on another install, to bring all data back.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+        <button class="btn btn-primary btn-sm" id="downloadBackupBtn">⬇ Download backup file</button>
+        <button class="btn btn-ghost btn-sm" id="copyBackupBtn">Copy backup text</button>
+      </div>
+      <div style="margin-bottom:12px;" id="restoreFileRow">
+        <button class="btn btn-ghost btn-sm" id="restoreFileBtn">⬆ Restore from file</button>
+        <input type="file" id="restoreFileInput" accept=".json,application/json,text/plain" style="display:none;" />
+      </div>
+      <div class="form-field"><label for="restoreText">Or paste backup text to restore</label>
+        <textarea id="restoreText" rows="3" placeholder="Paste backup text…" autocapitalize="off" autocorrect="off" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #cfd3c8;border-radius:10px;font:12px monospace;background:transparent;color:inherit;"></textarea></div>
+      <button class="btn btn-primary" id="restoreBtn">Restore from pasted text</button>
+      <div class="section-sub" id="restoreResult" style="margin-top:8px;"></div>
     </div>
 
     <div class="card">
@@ -1000,6 +1017,60 @@ function doGet(e) {
   }
 
   /* ---------------- LIVE PRICES (Yahoo Finance, NSE/BSE) ---------------- */
+  /* ---- Android app bridge (only present inside the ETF Tracker APK): CORS-free price fetch, clipboard, file save ---- */
+  var nativeCbs = {}, nativeSeq = 0;
+  window.__nativeFetchDone = function(id, status, body){
+    var cb = nativeCbs[id];
+    if(cb){ delete nativeCbs[id]; cb(status, body); }
+  };
+  function nativeFetch(url, regex){
+    return new Promise(function(resolve, reject){
+      var id = "n" + (++nativeSeq);
+      var to = setTimeout(function(){ delete nativeCbs[id]; reject(new Error("timeout")); }, 15000);
+      nativeCbs[id] = function(status, body){
+        clearTimeout(to);
+        if(status >= 200 && status < 300) resolve(body); else reject(new Error("HTTP " + status));
+      };
+      try{ window.AndroidBridge.fetchText(url, id, regex || ""); }
+      catch(e){ clearTimeout(to); delete nativeCbs[id]; reject(e); }
+    });
+  }
+  function symToTicker(sym){
+    var t = String(sym || "").toUpperCase();
+    if(/\.BO$/.test(t)) return "BSE:" + t.replace(/\.BO$/, "");
+    return "NSE:" + t.replace(/\.NS$/, "");
+  }
+  async function nativeQuote(ticker){
+    try{
+      var t = await nativeFetch(quoteLink(ticker) + "?hl=en", 'data-last-price="([0-9.,]+)"');
+      var v = parseFloat(String(t).replace(/,/g, ""));
+      if(v > 0) return { price: v, time: Date.now() };
+    }catch(e){}
+    var sym = yahooSymbol(ticker);
+    var txt = await nativeFetch("https://query1.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(sym) + "?interval=1d&range=1d");
+    return quoteFromJson(JSON.parse(txt));
+  }
+  async function copyText(text){
+    try{ if(window.AndroidBridge && window.AndroidBridge.copyText){ window.AndroidBridge.copyText(String(text)); return true; } }catch(e){}
+    try{ await navigator.clipboard.writeText(text); return true; }catch(e){}
+    try{
+      var ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      var ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    }catch(e){}
+    return false;
+  }
+  function saveWorkbook(wb, name){
+    if(window.AndroidBridge && window.AndroidBridge.saveFile){
+      var b64 = XLSX.write(wb, { bookType: "xlsx", type: "base64" });
+      window.AndroidBridge.saveFile(name, b64, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    } else {
+      XLSX.writeFile(wb, name);
+    }
+  }
   var pricesBusy = false;
   var priceSrcIdx = 0;
   function yahooSymbol(ticker){
@@ -1025,6 +1096,7 @@ function doGet(e) {
   }
   /* Ask Yahoo directly (2 hosts) at once; public proxies join in only if those are slow/blocked. First good answer wins. */
   function raceQuote(sym){
+    if(window.AndroidBridge) return nativeQuote(symToTicker(sym));
     return new Promise(function(resolve, reject){
       var path = "/v8/finance/chart/" + encodeURIComponent(sym) + "?interval=1d&range=1d&_=" + Date.now();
       var y1 = "https://query1.finance.yahoo.com" + path;
@@ -1152,6 +1224,7 @@ function doGet(e) {
   var pendingPxFund = null;
   /* No-setup attempt: read the Google Finance page through public CORS proxies; first valid answer wins */
   function raceGoogle(ticker){
+    if(window.AndroidBridge) return nativeQuote(ticker);
     return new Promise(function(resolve, reject){
       var g = quoteLink(ticker) + "?hl=en&_=" + Date.now();
       var srcs = [
@@ -1223,7 +1296,7 @@ function doGet(e) {
     if(!fid) return;
     pendingPxFund = null;
     var price = 0;
-    try{ price = parsePriceText(await navigator.clipboard.readText()); }catch(e){}
+    try{ price = parsePriceText(window.AndroidBridge && window.AndroidBridge.readClipboard ? window.AndroidBridge.readClipboard() : await navigator.clipboard.readText()); }catch(e){}
     if(price > 0){ await setFundPrice(fid, price); return; }
     var inp = document.querySelector('.cur-price-input[data-fid="' + fid + '"]');
     if(inp){ inp.focus(); }
@@ -1474,19 +1547,84 @@ function doGet(e) {
 
   document.getElementById("copyScriptBtn").addEventListener("click", async function(){
     var code = document.getElementById("gasCode").textContent.replace(/^\n/, "");
-    var ok = false;
-    try{ await navigator.clipboard.writeText(code); ok = true; }catch(e){}
-    if(!ok){
-      try{
-        var ta = document.createElement("textarea");
-        ta.value = code; ta.style.position = "fixed"; ta.style.opacity = "0";
-        document.body.appendChild(ta); ta.focus(); ta.select();
-        ok = document.execCommand("copy");
-        document.body.removeChild(ta);
-      }catch(e){}
-    }
+    var ok = await copyText(code);
     showToast(ok ? "Script copied. Paste it into script.google.com." : "Couldn't copy — long-press the box to copy manually.");
   });
+
+  var BACKUP_KEYS = [K_SETTINGS, K_FUNDS, K_NIFTY, K_RESERVES, K_CONTRIB, K_TXN, K_META];
+  async function buildBackupText(){
+    var data = {};
+    for(var i = 0; i < BACKUP_KEYS.length; i++){
+      var v = await Store.get(BACKUP_KEYS[i]);
+      if(v !== null && v !== undefined) data[BACKUP_KEYS[i]] = v;
+    }
+    return JSON.stringify({ app: "etf-tracker", v: 1, at: new Date().toISOString(), data: data }, null, 1);
+  }
+  function setRestoreMsg(t){ document.getElementById("restoreResult").textContent = t; }
+
+  document.getElementById("downloadBackupBtn").addEventListener("click", async function(){
+    var text = await buildBackupText();
+    var name = "ETF_Tracker_Backup_" + todayISO() + ".json";
+    try{
+      if(window.AndroidBridge && window.AndroidBridge.saveFile){
+        window.AndroidBridge.saveFile(name, btoa(unescape(encodeURIComponent(text))), "application/json");
+      } else {
+        var blob = new Blob([text], { type: "application/json" });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+      }
+      setRestoreMsg("Backup file ready: " + name + ". Keep it safe (Drive / WhatsApp to yourself).");
+      showToast("Backup file created.");
+    }catch(e){ setRestoreMsg("Couldn't create the backup file. Try Copy backup text instead."); }
+  });
+
+  document.getElementById("copyBackupBtn").addEventListener("click", async function(){
+    var text = await buildBackupText();
+    var ok = await copyText(text);
+    setRestoreMsg(ok ? ("Backup text copied (" + Math.max(1, Math.round(text.length/1024)) + " KB). Paste it somewhere safe, or into the Restore box on another install.") : "Couldn't copy the backup.");
+    showToast(ok ? "Backup copied." : "Couldn't copy the backup.");
+  });
+
+  function restoreFromText(raw){
+    var obj = null;
+    try{ obj = JSON.parse(String(raw || "").trim()); }catch(e){}
+    if(!obj || obj.app !== "etf-tracker" || !obj.data || typeof obj.data !== "object"){
+      setRestoreMsg("That doesn't look like an ETF Tracker backup. Use the backup file or the full copied text.");
+      return;
+    }
+    var when = obj.at ? (" from " + String(obj.at).slice(0, 10)) : "";
+    confirmModal("Replace all data?", "This overwrites funds, reserves, logs and settings on this device with the backup" + when + ".", async function(){
+      for(var i = 0; i < BACKUP_KEYS.length; i++){
+        var k = BACKUP_KEYS[i];
+        if(typeof obj.data[k] === "string") await Store.set(k, obj.data[k]);
+      }
+      await loadAll();
+      await checkRollover();
+      document.getElementById("restoreText").value = "";
+      renderActiveTab();
+      setRestoreMsg("Backup restored" + when + ".");
+      showToast("Backup restored.");
+    });
+  }
+  document.getElementById("restoreBtn").addEventListener("click", function(){
+    restoreFromText(document.getElementById("restoreText").value);
+  });
+  document.getElementById("restoreFileBtn").addEventListener("click", function(){
+    document.getElementById("restoreFileInput").click();
+  });
+  document.getElementById("restoreFileInput").addEventListener("change", function(e){
+    var f = e.target.files && e.target.files[0];
+    if(!f) return;
+    var rd = new FileReader();
+    rd.onload = function(){ restoreFromText(rd.result); e.target.value = ""; };
+    rd.onerror = function(){ setRestoreMsg("Couldn't read that file."); };
+    rd.readAsText(f);
+  });
+  if(window.AndroidBridge){ var rfr = document.getElementById("restoreFileRow"); if(rfr) rfr.style.display = "none"; }
+
   document.getElementById("saveProxyBtn").addEventListener("click", async function(){
     var url = (document.getElementById("setPriceProxy").value || "").trim();
     var out = document.getElementById("proxyTestResult");
@@ -1672,7 +1810,7 @@ function doGet(e) {
     ws5["!cols"] = [{wch:12},{wch:12}];
     XLSX.utils.book_append_sheet(wb, ws5, "Nifty Log");
 
-    XLSX.writeFile(wb, "ETF_Tracker_Statement_" + todayISO() + ".xlsx");
+    saveWorkbook(wb, "ETF_Tracker_Statement_" + todayISO() + ".xlsx");
     showToast("Excel statement downloaded.");
   });
 
@@ -1694,7 +1832,8 @@ function doGet(e) {
     if(moved > 0){ renderActiveTab(); showToast(fmtMoney(moved) + " moved from Regular to Dip Reserve (new month)."); }
   });
 
-  if ("serviceWorker" in navigator) {
+  if(window.AndroidBridge){ var lpc = document.getElementById("livePriceCard"); if(lpc) lpc.style.display = "none"; }
+  if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) {
     window.addEventListener("load", function(){
       navigator.serviceWorker.register("sw.js").catch(function(){ /* offline install unsupported in this context */ });
     });
